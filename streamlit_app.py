@@ -6,7 +6,7 @@ from datetime import datetime
 import math
 
 st.set_page_config(page_title="Transfer Öneri Uygulaması", layout="wide")
-st.title("📦 Mağazalar Arası Transfer Önerisi")
+st.title("📦 Mağazalar Arası Transfer Önerisi (Bölge Bazlı)")
 
 uploaded_file = st.file_uploader("Excel dosyasını yükleyin", type=[".xlsx"])
 
@@ -20,57 +20,59 @@ if uploaded_file:
     today = datetime.today().strftime('%Y-%m-%d')
     transfer_list = []
 
-    for lot_kodu, group in df_filtered.groupby("LotKodu"):
-        avg_cover = group["Mag. S/S"].mean()
-        donors = group[(group["Mag. S/S"] > avg_cover) & (group["Mgz Stok Ad."] >= 10)].copy()
-        receivers = group[(group["Mag. S/S"] < avg_cover) & (group["Stok Rezerve Ad."] == 0)].copy()
+    for lot_kodu, lot_group in df_filtered.groupby("LotKodu"):
+        for region, group in lot_group.groupby("Bölge Yöneticisi"):
+            avg_cover = group["Mag. S/S"].mean()
+            donors = group[(group["Mag. S/S"] > avg_cover) & (group["Mgz Stok Ad."] >= 10)].copy()
+            receivers = group[(group["Mag. S/S"] < avg_cover) & (group["Stok Rezerve Ad."] == 0)].copy()
 
-        donor_stok = donors.set_index("DepoAdı")["Mgz Stok Ad."].to_dict()
-        receiver_stok = receivers.set_index("DepoAdı")["Mgz Stok Ad."].to_dict()
+            donor_stok = donors.set_index("DepoAdı")["Mgz Stok Ad."].to_dict()
+            receiver_stok = receivers.set_index("DepoAdı")["Mgz Stok Ad."].to_dict()
 
-        for _, donor in donors.iterrows():
-            donor_name = donor["DepoAdı"]
-            for _, receiver in receivers.iterrows():
-                receiver_name = receiver["DepoAdı"]
-                if donor_name == receiver_name:
-                    continue
+            for _, donor in donors.iterrows():
+                donor_name = donor["DepoAdı"]
+                for _, receiver in receivers.iterrows():
+                    receiver_name = receiver["DepoAdı"]
+                    if donor_name == receiver_name:
+                        continue
 
-                donor_current_stock = donor_stok.get(donor_name, 0)
-                receiver_current_stock = receiver_stok.get(receiver_name, 0)
+                    donor_current_stock = donor_stok.get(donor_name, 0)
+                    receiver_current_stock = receiver_stok.get(receiver_name, 0)
 
-                max_transfer = int(receiver["Satış Ad."] * 2)
-                proposed_qty = math.floor(donor_current_stock / 2)
-                transfer_qty = min(proposed_qty, max_transfer)
+                    max_transfer = int(receiver["Satış Ad."] * 2)
+                    proposed_qty = math.floor(donor_current_stock / 2)
+                    transfer_qty = min(proposed_qty, max_transfer)
 
-                if transfer_qty <= 0 or (donor_current_stock - transfer_qty) < 10:
-                    continue
+                    if transfer_qty <= 0 or (donor_current_stock - transfer_qty) < 10:
+                        continue
 
-                new_donor_stock = donor_current_stock - transfer_qty
-                new_receiver_stock = receiver_current_stock + transfer_qty
+                    new_donor_stock = donor_current_stock - transfer_qty
+                    new_receiver_stock = receiver_current_stock + transfer_qty
 
-                donor_final_cover = new_donor_stock / (donor["Satış Ad."] + 1)
-                receiver_final_cover = new_receiver_stock / (receiver["Satış Ad."] + 1)
+                    donor_final_cover = new_donor_stock / (donor["Satış Ad."] + 1)
+                    receiver_final_cover = new_receiver_stock / (receiver["Satış Ad."] + 1)
 
-                transfer_list.append({
-                    "Analiz Tarihi": today,
-                    "Ürün Kodu": lot_kodu,
-                    "Ürün Adı": donor["LotAdi"],
-                    "Transfer Adedi": transfer_qty,
-                    "Gönderen Mağaza": donor_name,
-                    "Gönderen Stok (önce)": donor_current_stock,
-                    "Gönderen Cover (önce)": round(donor["Mag. S/S"], 2),
-                    "Gönderen Final Cover": round(donor_final_cover, 2),
-                    "Gönderen YTD Satış": donor["YTD Satış Ad."],
-                    "Alan Mağaza": receiver_name,
-                    "Alan Stok (önce)": receiver_current_stock,
-                    "Alan Cover (önce)": round(receiver["Mag. S/S"], 2),
-                    "Alan Final Cover": round(receiver_final_cover, 2),
-                    "Alan YTD Satış": receiver["YTD Satış Ad."],
-                    "Transfer Yönü": f"{donor_name} → {receiver_name}"
-                })
+                    transfer_list.append({
+                        "Analiz Tarihi": today,
+                        "Bölge Yöneticisi": region,
+                        "Ürün Kodu": lot_kodu,
+                        "Ürün Adı": donor["LotAdi"],
+                        "Transfer Adedi": transfer_qty,
+                        "Gönderen Mağaza": donor_name,
+                        "Gönderen Stok (önce)": donor_current_stock,
+                        "Gönderen Cover (önce)": round(donor["Mag. S/S"], 2),
+                        "Gönderen Final Cover": round(donor_final_cover, 2),
+                        "Gönderen YTD Satış": donor["YTD Satış Ad."],
+                        "Alan Mağaza": receiver_name,
+                        "Alan Stok (önce)": receiver_current_stock,
+                        "Alan Cover (önce)": round(receiver["Mag. S/S"], 2),
+                        "Alan Final Cover": round(receiver_final_cover, 2),
+                        "Alan YTD Satış": receiver["YTD Satış Ad."],
+                        "Transfer Yönü": f"{donor_name} → {receiver_name}"
+                    })
 
-                donor_stok[donor_name] = new_donor_stock
-                receiver_stok[receiver_name] = new_receiver_stock
+                    donor_stok[donor_name] = new_donor_stock
+                    receiver_stok[receiver_name] = new_receiver_stock
 
     transfer_df = pd.DataFrame(transfer_list)
 
@@ -85,7 +87,6 @@ if uploaded_file:
         }
         summary_df = pd.DataFrame(summary_data)
 
-        # Net Transfer Dengesi
         net_gonderilen = transfer_df.groupby("Gönderen Mağaza")["Transfer Adedi"].sum()
         net_alinan = transfer_df.groupby("Alan Mağaza")["Transfer Adedi"].sum()
         net_df = pd.concat([net_gonderilen, net_alinan], axis=1).fillna(0)
