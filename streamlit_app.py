@@ -1,133 +1,133 @@
 
 import streamlit as st
 import pandas as pd
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 from io import BytesIO
 from datetime import datetime
 import math
 
 st.set_page_config(page_title="Transfer Öneri Uygulaması", layout="wide")
-st.title("📦 Mağazalar Arası Transfer Önerisi (Bölge Bazlı)")
+st.title("📦 Google Sheets Tabanlı Transfer Önerisi")
 
-uploaded_file = st.file_uploader("Excel dosyasını yükleyin", type=[".xlsx"])
+# Gerekli girişler
+sheet_url = st.text_input("🔗 Google Sheets bağlantısını buraya yapıştırın:")
+json_file = st.file_uploader("🔐 Google Service Account JSON dosyasını yükleyin", type=["json"])
 
-if uploaded_file:
-    df = pd.read_excel(uploaded_file)
+if sheet_url and json_file:
+    try:
+        # Yetkilendirme ve bağlantı
+        scopes = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        creds = ServiceAccountCredentials.from_json_keyfile_name(json_file.name, scopes)
+        client = gspread.authorize(creds)
+        spreadsheet = client.open_by_url(sheet_url)
 
-    df_filtered = df[df["Mag. S/S"] > 0].copy()
-    df_filtered = df_filtered[df_filtered["Mgz Stok Ad."] > 0]
-    df_filtered["Stok Rezerve Ad."] = df_filtered["Stok Rezerve Ad."].fillna(0)
+        # Sayfaları oku
+        df_data = pd.DataFrame(spreadsheet.worksheet("Veri").get_all_records())
+        df_regions = pd.DataFrame(spreadsheet.worksheet("Bölgeler").get_all_records())
 
-    today = datetime.today().strftime('%Y-%m-%d')
-    transfer_list = []
+        # Kolon isimlerini normalize et
+        df_data.rename(columns={
+            "Ürün Hiyerarşisi - LotKodu": "LotKodu",
+            "Ürün Hiyerarşisi - LotAdi": "LotAdi",
+            "Ürün Hiyerarşisi - AileAdı": "Aile Adı",
+            "Ürün Hiyerarşisi - KategoriAdı": "Kategori Adı",
+            "Ürün Hiyerarşisi - AltKategoriAdı": "Alt Kategori Adı"
+        }, inplace=True)
 
-    for lot_kodu, lot_group in df_filtered.groupby("LotKodu"):
-        for region, group in lot_group.groupby("Bölge Yöneticisi"):
-            avg_cover = group["Mag. S/S"].mean()
-            donors = group[(group["Mag. S/S"] > avg_cover) & (group["Mgz Stok Ad."] >= 10)].copy()
-            receivers = group[(group["Mag. S/S"] < avg_cover) & (group["Stok Rezerve Ad."] == 0)].copy()
+        # Mağaza bilgilerini ana veriye ekle
+        df = pd.merge(df_data, df_regions, on="DepoAdı", how="left")
 
-            donor_stok = donors.set_index("DepoAdı")["Mgz Stok Ad."].to_dict()
-            receiver_stok = receivers.set_index("DepoAdı")["Mgz Stok Ad."].to_dict()
+        # Eksik stok düzeltme: stok negatif ve satış varsa stok = abs(stok)
+        df.loc[(df["Mgz Stok Ad."] < 0) & (df["Satış Ad."] > 0), "Mgz Stok Ad."] = df["Mgz Stok Ad."].abs()
 
-            for _, donor in donors.iterrows():
-                donor_name = donor["DepoAdı"]
-                for _, receiver in receivers.iterrows():
-                    receiver_name = receiver["DepoAdı"]
-                    if donor_name == receiver_name:
-                        continue
+        # Satış kolonunu tamamlama
+        df["Satış Ad."] = df["Satış Ad."].fillna(0)
+        df["Tahmini Satış"] = df["Satış Ad."]
+        df.loc[df["Tahmini Satış"] <= 0, "Tahmini Satış"] = df["Önceki Hafta Satış Miktar"]
+        df.loc[df["Tahmini Satış"].isna() | (df["Tahmini Satış"] <= 0), "Tahmini Satış"] = df["Önceki Ay Satış Miktar"] / 4
+        df["Tahmini Satış"] = df["Tahmini Satış"].fillna(0)
 
-                    donor_current_stock = donor_stok.get(donor_name, 0)
-                    receiver_current_stock = receiver_stok.get(receiver_name, 0)
+        # Yeni Cover hesapla
+        df["Mag. S/S"] = df["Mgz Stok Ad."] / (df["Tahmini Satış"] + 1)
 
-                    max_transfer = int(receiver["Satış Ad."] * 2)
-                    proposed_qty = math.floor(donor_current_stock / 2)
-                    transfer_qty = min(proposed_qty, max_transfer)
+        # Analiz Tarihi
+        today = datetime.today().strftime('%Y-%m-%d')
+        transfer_list = []
 
-                    if transfer_qty <= 0 or (donor_current_stock - transfer_qty) < 10:
-                        continue
+        for lot_kodu, group in df.groupby("LotKodu"):
+            for il in group["İl"].unique():
+                il_group = group[group["İl"] == il]
+                avg_cover = il_group["Mag. S/S"].mean()
+                donors = il_group[(il_group["Mag. S/S"] > avg_cover) & (il_group["Mag. S/S"] > 10) & (il_group["Mgz Stok Ad."] >= 10)].copy()
+                receivers = il_group[(il_group["Mag. S/S"] < avg_cover) & (il_group["Mag. S/S"] < 5) & (il_group["Stok Rezerve Ad."] == 0)].copy()
 
-                    new_donor_stock = donor_current_stock - transfer_qty
-                    new_receiver_stock = receiver_current_stock + transfer_qty
+                donor_stok = donors.set_index("DepoAdı")["Mgz Stok Ad."].to_dict()
+                receiver_stok = receivers.set_index("DepoAdı")["Mgz Stok Ad."].to_dict()
 
-                    donor_final_cover = new_donor_stock / (donor["Satış Ad."] + 1)
-                    receiver_final_cover = new_receiver_stock / (receiver["Satış Ad."] + 1)
+                for _, donor in donors.iterrows():
+                    donor_name = donor["DepoAdı"]
+                    for _, receiver in receivers.iterrows():
+                        receiver_name = receiver["DepoAdı"]
+                        if donor_name == receiver_name:
+                            continue
 
-                    transfer_list.append({
-                        "Analiz Tarihi": today,
-                        "Bölge Yöneticisi": region,
-                        "Ürün Kodu": lot_kodu,
-                        "Ürün Adı": donor["LotAdi"],
-                        "Transfer Adedi": transfer_qty,
-                        "Gönderen Mağaza": donor_name,
-                        "Gönderen Stok (önce)": donor_current_stock,
-                        "Gönderen Cover (önce)": round(donor["Mag. S/S"], 2),
-                        "Gönderen Final Cover": round(donor_final_cover, 2),
-                        "Gönderen YTD Satış": donor["YTD Satış Ad."],
-                        "Alan Mağaza": receiver_name,
-                        "Alan Stok (önce)": receiver_current_stock,
-                        "Alan Cover (önce)": round(receiver["Mag. S/S"], 2),
-                        "Alan Final Cover": round(receiver_final_cover, 2),
-                        "Alan YTD Satış": receiver["YTD Satış Ad."],
-                        "Transfer Yönü": f"{donor_name} → {receiver_name}"
-                    })
+                        donor_current_stock = donor_stok.get(donor_name, 0)
+                        receiver_current_stock = receiver_stok.get(receiver_name, 0)
 
-                    donor_stok[donor_name] = new_donor_stock
-                    receiver_stok[receiver_name] = new_receiver_stock
+                        max_transfer = int(receiver["Tahmini Satış"] * 2)
+                        proposed_qty = math.floor(donor_current_stock / 2)
+                        transfer_qty = min(proposed_qty, max_transfer)
 
-    transfer_df = pd.DataFrame(transfer_list)
+                        if transfer_qty <= 0 or (donor_current_stock - transfer_qty) < 10:
+                            continue
 
-    if not transfer_df.empty:
-        summary_data = {
-            "Analiz Tarihi": [today],
-            "Toplam Ürün Sayısı": [transfer_df["Ürün Kodu"].nunique()],
-            "Toplam Transfer Sayısı": [len(transfer_df)],
-            "Toplam Transfer Adedi": [transfer_df["Transfer Adedi"].sum()],
-            "Gönderen Mağaza Sayısı": [transfer_df["Gönderen Mağaza"].nunique()],
-            "Alan Mağaza Sayısı": [transfer_df["Alan Mağaza"].nunique()]
-        }
-        summary_df = pd.DataFrame(summary_data)
+                        new_donor_stock = donor_current_stock - transfer_qty
+                        new_receiver_stock = receiver_current_stock + transfer_qty
 
-        net_gonderilen = transfer_df.groupby("Gönderen Mağaza")["Transfer Adedi"].sum()
-        net_alinan = transfer_df.groupby("Alan Mağaza")["Transfer Adedi"].sum()
-        net_df = pd.concat([net_gonderilen, net_alinan], axis=1).fillna(0)
-        net_df.columns = ["Gönderilen", "Alınan"]
-        net_df["Net Transfer"] = net_df["Alınan"] - net_df["Gönderilen"]
-        net_df = net_df.reset_index()
+                        donor_final_cover = new_donor_stock / (donor["Tahmini Satış"] + 1)
+                        receiver_final_cover = new_receiver_stock / (receiver["Tahmini Satış"] + 1)
 
-        top_donors = net_gonderilen.sort_values(ascending=False).head(5).reset_index()
-        top_donors.columns = ["Mağaza", "Gönderilen Toplam Adet"]
+                        transfer_list.append({
+                            "Analiz Tarihi": today,
+                            "İl": il,
+                            "Ürün Kodu": lot_kodu,
+                            "Ürün Adı": donor["LotAdi"],
+                            "Aile Adı": donor["Aile Adı"],
+                            "Kategori Adı": donor["Kategori Adı"],
+                            "Alt Kategori Adı": donor["Alt Kategori Adı"],
+                            "Transfer Adedi": transfer_qty,
+                            "Gönderen Mağaza": donor_name,
+                            "Gönderen Stok (önce)": donor_current_stock,
+                            "Gönderen Cover (önce)": round(donor["Mag. S/S"], 2),
+                            "Gönderen Final Cover": round(donor_final_cover, 2),
+                            "Alan Mağaza": receiver_name,
+                            "Alan Stok (önce)": receiver_current_stock,
+                            "Alan Cover (önce)": round(receiver["Mag. S/S"], 2),
+                            "Alan Final Cover": round(receiver_final_cover, 2),
+                            "Transfer Yönü": f"{donor_name} → {receiver_name}"
+                        })
 
-        top_receivers = net_alinan.sort_values(ascending=False).head(5).reset_index()
-        top_receivers.columns = ["Mağaza", "Alınan Toplam Adet"]
+                        donor_stok[donor_name] = new_donor_stock
+                        receiver_stok[receiver_name] = new_receiver_stock
 
-        top_products = transfer_df.groupby(["Ürün Kodu", "Ürün Adı"])["Transfer Adedi"].sum().sort_values(ascending=False).head(5).reset_index()
-        top_products.columns = ["Ürün Kodu", "Ürün Adı", "Toplam Transfer Adedi"]
-    else:
-        summary_df = pd.DataFrame()
-        net_df = pd.DataFrame()
-        top_donors = pd.DataFrame()
-        top_receivers = pd.DataFrame()
-        top_products = pd.DataFrame()
+        transfer_df = pd.DataFrame(transfer_list)
 
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        transfer_df.to_excel(writer, sheet_name="Transfer Önerileri", index=False)
-        summary_df.to_excel(writer, sheet_name="Yönetici Özeti", index=False, startrow=0)
-        net_df.to_excel(writer, sheet_name="Yönetici Özeti", index=False, startrow=7)
-        top_donors.to_excel(writer, sheet_name="Yönetici Özeti", index=False, startrow=15)
-        top_receivers.to_excel(writer, sheet_name="Yönetici Özeti", index=False, startrow=22)
-        top_products.to_excel(writer, sheet_name="Yönetici Özeti", index=False, startrow=29)
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            transfer_df.to_excel(writer, sheet_name="Transfer Önerileri", index=False)
+        output.seek(0)
 
-    output.seek(0)
+        st.success("Transfer önerileri başarıyla oluşturuldu!")
+        st.download_button(
+            label="📥 Excel Raporunu İndir",
+            data=output,
+            file_name="transfer_raporu.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+        st.dataframe(transfer_df.head(20))
 
-    st.success("Transfer önerileri başarıyla oluşturuldu!")
-    st.download_button(
-        label="📥 Excel Raporunu İndir",
-        data=output,
-        file_name="transfer_raporu_ve_ozet.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
-    st.subheader("📋 Örnek Transfer Tablosu")
-    st.dataframe(transfer_df.head(20))
+    except Exception as e:
+        st.error(f"Hata oluştu: {e}")
 else:
-    st.info("Başlamak için bir dosya yükleyin.")
+    st.info("Google Sheets bağlantısını ve JSON dosyasını girerek başlayabilirsiniz.")
