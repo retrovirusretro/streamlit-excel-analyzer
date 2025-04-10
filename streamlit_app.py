@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 from io import BytesIO
@@ -33,17 +34,20 @@ if uploaded_file:
                 receiver_name = receiver["DepoAdı"]
                 if donor_name == receiver_name:
                     continue
+
                 donor_current_stock = donor_stok.get(donor_name, 0)
                 receiver_current_stock = receiver_stok.get(receiver_name, 0)
-                if donor_current_stock < 10:
-                    continue
+
                 max_transfer = int(receiver["Satış Ad."] * 2)
                 proposed_qty = math.floor(donor_current_stock / 2)
                 transfer_qty = min(proposed_qty, max_transfer)
-                if transfer_qty <= 0:
+
+                if transfer_qty <= 0 or (donor_current_stock - transfer_qty) < 10:
                     continue
+
                 new_donor_stock = donor_current_stock - transfer_qty
                 new_receiver_stock = receiver_current_stock + transfer_qty
+
                 donor_final_cover = new_donor_stock / (donor["Satış Ad."] + 1)
                 receiver_final_cover = new_receiver_stock / (receiver["Satış Ad."] + 1)
 
@@ -64,6 +68,7 @@ if uploaded_file:
                     "Alan YTD Satış": receiver["YTD Satış Ad."],
                     "Transfer Yönü": f"{donor_name} → {receiver_name}"
                 })
+
                 donor_stok[donor_name] = new_donor_stock
                 receiver_stok[receiver_name] = new_receiver_stock
 
@@ -79,14 +84,26 @@ if uploaded_file:
             "Alan Mağaza Sayısı": [transfer_df["Alan Mağaza"].nunique()]
         }
         summary_df = pd.DataFrame(summary_data)
-        top_donors = transfer_df.groupby("Gönderen Mağaza")["Transfer Adedi"].sum().sort_values(ascending=False).head(5).reset_index()
+
+        # Net Transfer Dengesi
+        net_gonderilen = transfer_df.groupby("Gönderen Mağaza")["Transfer Adedi"].sum()
+        net_alinan = transfer_df.groupby("Alan Mağaza")["Transfer Adedi"].sum()
+        net_df = pd.concat([net_gonderilen, net_alinan], axis=1).fillna(0)
+        net_df.columns = ["Gönderilen", "Alınan"]
+        net_df["Net Transfer"] = net_df["Alınan"] - net_df["Gönderilen"]
+        net_df = net_df.reset_index()
+
+        top_donors = net_gonderilen.sort_values(ascending=False).head(5).reset_index()
         top_donors.columns = ["Mağaza", "Gönderilen Toplam Adet"]
-        top_receivers = transfer_df.groupby("Alan Mağaza")["Transfer Adedi"].sum().sort_values(ascending=False).head(5).reset_index()
+
+        top_receivers = net_alinan.sort_values(ascending=False).head(5).reset_index()
         top_receivers.columns = ["Mağaza", "Alınan Toplam Adet"]
+
         top_products = transfer_df.groupby(["Ürün Kodu", "Ürün Adı"])["Transfer Adedi"].sum().sort_values(ascending=False).head(5).reset_index()
         top_products.columns = ["Ürün Kodu", "Ürün Adı", "Toplam Transfer Adedi"]
     else:
         summary_df = pd.DataFrame()
+        net_df = pd.DataFrame()
         top_donors = pd.DataFrame()
         top_receivers = pd.DataFrame()
         top_products = pd.DataFrame()
@@ -95,9 +112,11 @@ if uploaded_file:
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         transfer_df.to_excel(writer, sheet_name="Transfer Önerileri", index=False)
         summary_df.to_excel(writer, sheet_name="Yönetici Özeti", index=False, startrow=0)
-        top_donors.to_excel(writer, sheet_name="Yönetici Özeti", index=False, startrow=5)
-        top_receivers.to_excel(writer, sheet_name="Yönetici Özeti", index=False, startrow=12)
-        top_products.to_excel(writer, sheet_name="Yönetici Özeti", index=False, startrow=19)
+        net_df.to_excel(writer, sheet_name="Yönetici Özeti", index=False, startrow=7)
+        top_donors.to_excel(writer, sheet_name="Yönetici Özeti", index=False, startrow=15)
+        top_receivers.to_excel(writer, sheet_name="Yönetici Özeti", index=False, startrow=22)
+        top_products.to_excel(writer, sheet_name="Yönetici Özeti", index=False, startrow=29)
+
     output.seek(0)
 
     st.success("Transfer önerileri başarıyla oluşturuldu!")
@@ -111,4 +130,3 @@ if uploaded_file:
     st.dataframe(transfer_df.head(20))
 else:
     st.info("Başlamak için bir dosya yükleyin.")
-
